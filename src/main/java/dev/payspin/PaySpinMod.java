@@ -51,8 +51,11 @@ public class PaySpinMod implements ClientModInitializer {
     // ===================================================================================
 
     // "Name paid you $1,000,000" / "$1M" / "$2.5m"
-    private static final Pattern PAID =
-            Pattern.compile("^(\\w{3,16}) paid you \\$([0-9][0-9,]*(?:\\.[0-9]+)?)\\s*([kKmMbB])?\\b.*$");
+    // The line must START with the payer (optionally after symbols or a [Rank] tag). A player typing
+    // "Steve paid you $50m" in public chat can't fake it, because chat lines start with THEIR name.
+    private static final Pattern PAID = Pattern.compile(
+            "^[^A-Za-z0-9_]*(?:\\[[^\\]]*\\]\\s*)?(\\w{3,16}) paid you [^0-9]{0,3}([0-9][0-9,]*(?:\\.[0-9]+)?)\\s*([kKmMbB])?(?![A-Za-z0-9]).*$",
+            Pattern.CASE_INSENSITIVE);
 
     private static final String CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
     private static final DecimalFormat MULT_FMT = new DecimalFormat("0.##");
@@ -77,7 +80,8 @@ public class PaySpinMod implements ClientModInitializer {
 
     private static boolean enabled = true;
     private static boolean autoPay = true;
-    private static boolean alwaysShow = true;   // keep the spinner on screen while idle
+    private static boolean alwaysShow = true;
+    private static boolean debug = false;   // keep the spinner on screen while idle
 
     // ---------------------------------------------------------------------------------
 
@@ -98,10 +102,17 @@ public class PaySpinMod implements ClientModInitializer {
 
         // 1) watch chat for payments
         ClientReceiveMessageEvents.GAME.register((message, overlay) -> {
-            if (overlay) return;
-            String text = message.getString().trim();
+            String text = message.getString().replace('\u00A0', ' ').replaceAll("\\s+", " ").trim();
             Matcher m = PAID.matcher(text);
-            if (!m.matches()) return;
+            boolean ok = m.matches();
+            if (text.toLowerCase().contains("paid")) {
+                System.out.println("[PaySpin] saw: " + text + " -> " + (ok ? "MATCHED" : "no match"));
+                if (debug) {
+                    Minecraft.getInstance().execute(() ->
+                            say("debug: saw [" + text + "] -> " + (ok ? "MATCHED" : "no match")));
+                }
+            }
+            if (!ok) return;
             long amount = parseAmount(m.group(2), m.group(3));
             if (amount <= 0) return;
             String name = m.group(1);
@@ -133,6 +144,11 @@ public class PaySpinMod implements ClientModInitializer {
                         .then(ClientCommandManager.literal("autopay").executes(c -> {
                             autoPay = !autoPay;
                             fb(c, "Auto-pay is now " + (autoPay ? "ON" : "OFF (results shown, no /pay sent)"));
+                            return 1;
+                        }))
+                        .then(ClientCommandManager.literal("debug").executes(c -> {
+                            debug = !debug;
+                            fb(c, "Debug is now " + (debug ? "ON: any chat line containing 'paid' is echoed here" : "OFF"));
                             return 1;
                         }))
                         .then(ClientCommandManager.literal("hud").executes(c -> {
