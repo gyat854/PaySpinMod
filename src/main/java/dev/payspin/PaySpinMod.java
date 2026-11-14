@@ -77,6 +77,7 @@ public class PaySpinMod implements ClientModInitializer {
 
     private static boolean enabled = true;
     private static boolean autoPay = true;
+    private static boolean alwaysShow = true;   // keep the spinner on screen while idle
 
     // ---------------------------------------------------------------------------------
 
@@ -132,6 +133,11 @@ public class PaySpinMod implements ClientModInitializer {
                         .then(ClientCommandManager.literal("autopay").executes(c -> {
                             autoPay = !autoPay;
                             fb(c, "Auto-pay is now " + (autoPay ? "ON" : "OFF (results shown, no /pay sent)"));
+                            return 1;
+                        }))
+                        .then(ClientCommandManager.literal("hud").executes(c -> {
+                            alwaysShow = !alwaysShow;
+                            fb(c, "Always-on spinner is now " + (alwaysShow ? "ON" : "OFF (only shows during spins)"));
                             return 1;
                         }))
                         .then(ClientCommandManager.literal("skip").executes(c -> {
@@ -290,7 +296,8 @@ public class PaySpinMod implements ClientModInitializer {
     }
 
     private static void render(GuiGraphics g, DeltaTracker delta) {
-        if (phase == Phase.IDLE || current == null) return;
+        boolean idle = phase == Phase.IDLE || current == null;
+        if (idle && !alwaysShow) return;
 
         Minecraft mc = Minecraft.getInstance();
         Font font = mc.font;
@@ -310,8 +317,13 @@ public class PaySpinMod implements ClientModInitializer {
 
         // title + subtitle
         center(g, font, Component.literal("PAY TO SPIN").withStyle(ChatFormatting.BOLD), cx, py1 + 7, WHITE);
-        center(g, font, Component.literal(code + "  \u2022  " + money(current.stake()) + " stake  \u2022  " + current.name()),
-                cx, py1 + 22, GREY);
+        if (idle) {
+            center(g, font, Component.literal("Pay me " + money(MIN_STAKE) + " - " + money(MAX_STAKE) + " to spin"),
+                    cx, py1 + 22, GREY);
+        } else {
+            center(g, font, Component.literal(code + "  \u2022  " + money(current.stake()) + " stake  \u2022  " + current.name()),
+                    cx, py1 + 22, GREY);
+        }
 
         // strip
         int stripY = py1 + 46;
@@ -319,8 +331,9 @@ public class PaySpinMod implements ClientModInitializer {
         int sx1 = cx - (VISIBLE * TW) / 2;
         int sx2 = cx + (VISIBLE * TW) / 2;
 
-        double pos = position(now);
         int n = TILES.size();
+        // idle: slow endless scroll (0.5 tile/s). The strip loops every n tiles, so it wraps seamlessly.
+        double pos = idle ? (now % (n * 2000L)) / 2000.0 : position(now);
 
         g.enableScissor(sx1, stripY, sx2, stripY + stripH);
         int kStart = (int) Math.floor(pos) - VISIBLE / 2 - 1;
@@ -346,7 +359,9 @@ public class PaySpinMod implements ClientModInitializer {
 
         // status
         int fy = py1 + 100;
-        if (phase == Phase.SPINNING) {
+        if (idle) {
+            center(g, font, Component.literal("Waiting for a payment..."), cx, fy, GOLD);
+        } else if (phase == Phase.SPINNING) {
             center(g, font, Component.literal("Spinning..."), cx, fy, GOLD);
         } else {
             center(g, font, Component.literal(resultLine), cx, fy, WHITE);

@@ -3,7 +3,7 @@
   "id": "payspin",
   "version": "${version}",
   "name": "PaySpin",
-  "description": "Pay-to-spin host overlay. Watches for payments, spins a multiplier strip, and auto-pays the winnings.",
+  "description": "Pay-to-spin host overlay: watches 'X paid you $N', spins a multiplier strip, auto-pays the winnings.",
   "authors": ["you"],
   "license": "MIT",
   "environment": "client",
