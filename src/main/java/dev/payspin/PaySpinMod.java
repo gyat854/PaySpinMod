@@ -21,8 +21,11 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 
 import java.text.DecimalFormat;
-import java.nio.file.*;
-import java.io.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.util.Properties;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -56,27 +59,23 @@ public class PaySpinMod implements ClientModInitializer {
     // "Name paid you $1,000,000" / "$1M" / "$2.5m"
     // The line must START with the payer (optionally after symbols or a [Rank] tag). A player typing
     // "Steve paid you $50m" in public chat can't fake it, because chat lines start with THEIR name.
+    // Real server GAME messages: "ChrisT826841 paid you $1M" and ".ChrisT826841 paid you $1M".
     private static final Pattern PAID = Pattern.compile(
-            "^(?:\\[[^\\]]+\\]\\s*)?(\\.?[A-Za-z0-9_]{3,16}) paid you \\$?([0-9][0-9,]*(?:\\.[0-9]+)?)\\s*([kKmMbB])?(?:[.! ]*)$",
+            "^(?:\\[[^\\]]+\\]\\s*)?(\\.?[A-Za-z0-9_]{3,16})\\s+paid\\s+you\\s+\\$?([0-9][0-9,]*(?:\\.[0-9]+)?)\\s*([kKmMbB])?\\s*[.!]?\\s*$",
             Pattern.CASE_INSENSITIVE);
-    private static final Pattern CONFIRM = Pattern.compile(
-            "^You paid (\\.?[A-Za-z0-9_]{3,16}) \\$?([0-9][0-9,]*(?:\\.[0-9]+)?)\\s*([kKmMbB])?[.! ]*$",
+    private static final Pattern SENT = Pattern.compile(
+            "^You paid (\\.?[A-Za-z0-9_]{3,16})\\s+\\$?([0-9][0-9,]*(?:\\.[0-9]+)?)\\s*([kKmMbB])?\\s*[.!]?\\s*$",
             Pattern.CASE_INSENSITIVE);
-    private static final Pattern FAILURE = Pattern.compile(
-            "(?i).*(?:insufficient funds|not enough money|player not found|unknown player|cannot pay|can't pay|payment failed).*" );
-    private static final Deque<Payment> PAYMENTS = new ArrayDeque<>();
-    private static Payment activePayment;
-    private static long lastPayCommand;
-    private static boolean loaded;
-    private static Path ledger;
-    private static class Payment {
-        String id, name, status;
-        long amount, sentAt;
-        int attempts;
-        Payment(String id,String name,long amount,String status) {
-            this.id=id;this.name=name;this.amount=amount;this.status=status;
-        }
-    }
+    private static final Pattern REJECTED = Pattern.compile(
+            "(?i).*(?:not enough money|insufficient funds|cannot pay|can't pay|could not pay|player not found|player is not online|unknown player|payment failed|invalid player|invalid amount).*" );
+    private record Payout(String id, String name, long amount, String state, int attempts, long when) {}
+    private static final Deque<Payout> PAYOUTS = new ArrayDeque<>();
+    private static Payout awaiting;
+    private static boolean ledgerLoaded = false;
+    private static Path ledgerFile;
+    private static long lastPayCommand = 0;
+    private static final long PAY_GAP_MS = 3000;
+    private static final long CONFIRM_MS = 12000;
 
     private static final String CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
     private static final DecimalFormat MULT_FMT = new DecimalFormat("0.##");
@@ -108,20 +107,21 @@ public class PaySpinMod implements ClientModInitializer {
 
     @Override
     public void onInitializeClient() {
-        // Requested fair odds. WARNING: 260.5% expected payout (host loses on average).
-        TILES.add(new Tile("Loss", new ItemStack(Items.BARRIER), 0, 200, 0xFFC62828));
-        TILES.add(new Tile("Gold", new ItemStack(Items.GOLD_INGOT), 2, 180, 0xFF2E9E3E));
-        TILES.add(new Tile("Coal", new ItemStack(Items.COAL), 0.1, 50, 0xFF4A5565));
+        // 93.8% RTP / 6.2% house edge. Weights sum to 2000.
+        TILES.add(new Tile("Loss", new ItemStack(Items.BARRIER), 0, 500, 0xFFC62828));
+        TILES.add(new Tile("Gold", new ItemStack(Items.GOLD_INGOT), 2, 262, 0xFF2E9E3E));
+        TILES.add(new Tile("Coal", new ItemStack(Items.COAL), 0.1, 100, 0xFF4A5565));
         TILES.add(new Tile("Copper", new ItemStack(Items.COPPER_INGOT), 0.4, 100, 0xFF1E9BB0));
-        TILES.add(new Tile("Iron", new ItemStack(Items.IRON_INGOT), 1, 250, 0xFF2F5BD0));
-        TILES.add(new Tile("Emerald", new ItemStack(Items.EMERALD), 4, 100, 0xFFD03F9A));
-        TILES.add(new Tile("Diamond", new ItemStack(Items.DIAMOND), 7, 50, 0xFFD0782F));
-        TILES.add(new Tile("Amethyst", new ItemStack(Items.AMETHYST_SHARD), 12, 40, 0xFFD0B02F));
-        TILES.add(new Tile("JACKPOT", new ItemStack(Items.NETHERITE_INGOT), 24, 30, 0xFFE040FB));
+        TILES.add(new Tile("Iron", new ItemStack(Items.IRON_INGOT), 1, 988, 0xFF2F5BD0));
+        TILES.add(new Tile("Emerald", new ItemStack(Items.EMERALD), 4, 30, 0xFFD03F9A));
+        TILES.add(new Tile("Diamond", new ItemStack(Items.DIAMOND), 7, 14, 0xFFD0782F));
+        TILES.add(new Tile("Amethyst", new ItemStack(Items.AMETHYST_SHARD), 12, 4, 0xFFD0B02F));
+        TILES.add(new Tile("JACKPOT", new ItemStack(Items.NETHERITE_INGOT), 24, 2, 0xFFE040FB));
 
         // 1) watch chat for payments
         ClientReceiveMessageEvents.GAME.register((message, overlay) -> {
             String text = message.getString().replace('\u00A0', ' ').replaceAll("\\s+", " ").trim();
+            onPayReply(text);
             Matcher m = PAID.matcher(text);
             boolean ok = m.matches();
             if (text.toLowerCase().contains("paid")) {
@@ -136,13 +136,6 @@ public class PaySpinMod implements ClientModInitializer {
             if (amount <= 0) return;
             String name = m.group(1);
             Minecraft.getInstance().execute(() -> onPayment(name, amount, false));
-        });
-
-        ClientReceiveMessageEvents.GAME.register((message, overlay) -> {
-            if (!overlay) {
-                String line = message.getString().replace('\u00A0', ' ').replaceAll("\\s+", " ").trim();
-                Minecraft.getInstance().execute(() -> confirmPayment(line));
-            }
         });
 
         // 2) run the state machine
@@ -197,11 +190,14 @@ public class PaySpinMod implements ClientModInitializer {
                             return 1;
                         }))
                         .then(ClientCommandManager.literal("unpaid").executes(c -> {
-                            int n=0;
-                            for (Payment p : PAYMENTS) if (!"CONFIRMED".equals(p.status)) {
-                                fb(c,p.id+" "+p.name+" "+money(p.amount)+" ["+p.status+"]");n++;
+                            int count = 0;
+                            for (Payout x : PAYOUTS) {
+                                if (!x.state().equals("CONFIRMED")) {
+                                    fb(c, x.id() + " " + x.name() + " " + money(x.amount()) + " [" + x.state() + "]");
+                                    count++;
+                                }
                             }
-                            if(n==0) fb(c,"No outstanding payouts.");
+                            if (count == 0) fb(c, "No unpaid payout records.");
                             return 1;
                         }))
                         .then(ClientCommandManager.literal("test")
@@ -241,7 +237,7 @@ public class PaySpinMod implements ClientModInitializer {
                     : "Queue full, " + name + " paid " + money(amount))
                     + (REFUND_OUT_OF_RANGE && !dry && autoPay ? " - refunding." : " - ignored."));
             if (REFUND_OUT_OF_RANGE && !dry && autoPay && mc.getConnection() != null) {
-                queuePayout(name, amount, "QUEUED");
+                addPayout(name, amount);
             }
             return;
         }
@@ -253,9 +249,9 @@ public class PaySpinMod implements ClientModInitializer {
 
     private static void tick(Minecraft mc) {
         if (mc.player == null || mc.level == null) return;
-        if (!loaded) loadLedger(mc);
+        if (!ledgerLoaded) loadLedger(mc);
         long now = System.currentTimeMillis();
-        processPayments(mc, now);
+        processPayouts(mc, now);
         switch (phase) {
             case IDLE -> {
                 if (!QUEUE.isEmpty() && enabled) start(now);
@@ -289,7 +285,7 @@ public class PaySpinMod implements ClientModInitializer {
         if (MAX_PAYOUT > 0 && payout > MAX_PAYOUT) payout = MAX_PAYOUT;
 
         boolean willPay = payout > 0 && !current.dry() && autoPay;
-        if (payout > 0 && !current.dry()) queuePayout(current.name(), payout, autoPay ? "QUEUED" : "HELD");
+        if (payout > 0 && !current.dry()) addPayout(current.name(), payout);
 
         String mult = MULT_FMT.format(result.mult()) + "x";
         if (payout > current.stake()) {
@@ -302,7 +298,7 @@ public class PaySpinMod implements ClientModInitializer {
             resultLine = mult + "  -  " + current.name() + " lost " + money(current.stake());
         }
         say("[" + code + "] " + resultLine
-                + (current.dry() ? " (TEST, nothing sent)" : willPay ? " (queued, NOT confirmed yet)" : payout > 0 ? " (NOT paid: autopay off)" : ""));
+                + (current.dry() ? " (TEST, nothing sent)" : willPay ? " (queued; not yet confirmed)" : payout > 0 ? " (queued; autopay off)" : ""));
 
         phase = Phase.RESULT;
         phaseStart = now;
@@ -330,110 +326,118 @@ public class PaySpinMod implements ClientModInitializer {
         return String.format("%.3f", ev / total);
     }
 
-    private static void queuePayout(String name,long amount,String status) {
-        Payment p=new Payment(newCode(),name,amount,status);
-        PAYMENTS.addLast(p);
+    // Journal payouts before sending any command. An unanswered /pay is UNCERTAIN,
+    // never automatically retried: otherwise players could be paid twice.
+    private static void addPayout(String name, long amount) {
+        PAYOUTS.addLast(new Payout(newCode(), name, amount, "QUEUED", 0, 0));
         saveLedger();
-        say("Payout "+p.id+" "+name+" "+money(amount)+" ["+status+"]");
     }
 
-    private static void processPayments(Minecraft mc,long now) {
-        if(activePayment!=null) {
-            if(now-activePayment.sentAt>12000) {
-                activePayment.status="UNCERTAIN";
-                say("WARNING: "+activePayment.id+" has no confirmation. Check manually; NOT retrying to avoid double pay.");
-                activePayment=null;
-                saveLedger();
+    private static void replacePayout(Payout old, Payout next) {
+        Deque<Payout> copy = new ArrayDeque<>();
+        for (Payout p : PAYOUTS) copy.addLast(p == old ? next : p);
+        PAYOUTS.clear(); PAYOUTS.addAll(copy);
+        saveLedger();
+    }
+
+    private static void processPayouts(Minecraft mc, long now) {
+        if (awaiting != null) {
+            if (now - awaiting.when() > CONFIRM_MS) {
+                replacePayout(awaiting, new Payout(awaiting.id(), awaiting.name(), awaiting.amount(), "UNCERTAIN", awaiting.attempts(), awaiting.when()));
+                say("WARNING: payout " + awaiting.id() + " unconfirmed. Check /payspin unpaid and server balance before manual action.");
+                awaiting = null;
             }
             return;
         }
-        if(!autoPay || mc.getConnection()==null || now-lastPayCommand<3000) return;
-        for(Payment p:PAYMENTS) {
-            if(!"QUEUED".equals(p.status) && !"RETRY".equals(p.status)) continue;
-            if(p.sentAt>now) continue;
-            p.status="SENT";
-            p.sentAt=now;
-            p.attempts++;
-            activePayment=p;
-            lastPayCommand=now;
-            saveLedger(); // journal BEFORE sending
-            mc.getConnection().sendCommand(PAY_COMMAND+" "+p.name+" "+p.amount);
-            say("Sent "+p.id+"; waiting for server confirmation.");
+        if (!autoPay || mc.getConnection() == null || now - lastPayCommand < PAY_GAP_MS) return;
+        for (Payout p : PAYOUTS) {
+            if (!(p.state().equals("QUEUED") || p.state().equals("RETRY"))) continue;
+            if (p.when() > now) continue;
+            Payout sent = new Payout(p.id(), p.name(), p.amount(), "SENT", p.attempts() + 1, now);
+            replacePayout(p, sent);
+            awaiting = sent;
+            lastPayCommand = now;
+            mc.getConnection().sendCommand(PAY_COMMAND + " " + sent.name() + " " + sent.amount());
+            say("Payout " + sent.id() + " sent; awaiting confirmation.");
             break;
         }
     }
 
-    private static void confirmPayment(String line) {
-        Payment p=activePayment;
-        if(p==null) return;
-        Matcher m=CONFIRM.matcher(line);
-        if(m.matches()) {
-            if(p.name.equalsIgnoreCase(m.group(1)) && parseAmount(m.group(2),m.group(3))==p.amount) {
-                p.status="CONFIRMED";
-                say("Confirmed paid: "+p.id+" "+p.name+" "+money(p.amount));
-                activePayment=null;
-                saveLedger();
+    private static void onPayReply(String text) {
+        if (awaiting == null) return;
+        Matcher m = SENT.matcher(text);
+        if (m.matches()) {
+            long amount = parseAmount(m.group(2), m.group(3));
+            if (awaiting.name().equalsIgnoreCase(m.group(1)) && amount == awaiting.amount()) {
+                replacePayout(awaiting, new Payout(awaiting.id(), awaiting.name(), awaiting.amount(), "CONFIRMED", awaiting.attempts(), awaiting.when()));
+                say("Confirmed payout " + awaiting.id() + " to " + awaiting.name());
+                awaiting = null;
             }
-        } else if(FAILURE.matcher(line).matches()) {
-            p.status=p.attempts<3?"RETRY":"FAILED";
-            p.sentAt=System.currentTimeMillis()+3000;
-            say("Payment "+p.id+" rejected: "+line+" ["+p.status+"]");
-            activePayment=null;
-            saveLedger();
+        } else if (REJECTED.matcher(text).matches()) {
+            String state = awaiting.attempts() < 3 ? "RETRY" : "FAILED";
+            replacePayout(awaiting, new Payout(awaiting.id(), awaiting.name(), awaiting.amount(), state, awaiting.attempts(), System.currentTimeMillis() + PAY_GAP_MS));
+            say("Payout " + awaiting.id() + " rejected; status " + state);
+            awaiting = null;
         }
     }
 
     private static void loadLedger(Minecraft mc) {
-        loaded=true;
-        ledger=mc.gameDirectory.toPath().resolve("config").resolve("payspin-ledger.properties");
-        if(!Files.exists(ledger)) return;
-        try(InputStream in=Files.newInputStream(ledger)) {
-            Properties props=new Properties();props.load(in);
-            for(int i=0;i<Integer.parseInt(props.getProperty("count","0"));i++) {
-                String key="p."+i+".";
-                Payment p=new Payment(props.getProperty(key+"id"),props.getProperty(key+"name"),
-                    Long.parseLong(props.getProperty(key+"amount")),props.getProperty(key+"status"));
-                p.attempts=Integer.parseInt(props.getProperty(key+"attempts","0"));
-                if("SENT".equals(p.status)) p.status="UNCERTAIN";
-                PAYMENTS.addLast(p);
+        ledgerLoaded = true;
+        ledgerFile = mc.gameDirectory.toPath().resolve("config").resolve("payspin-ledger.properties");
+        if (!Files.exists(ledgerFile)) return;
+        try (InputStream in = Files.newInputStream(ledgerFile)) {
+            Properties props = new Properties(); props.load(in);
+            int count = Integer.parseInt(props.getProperty("count", "0"));
+            for (int i = 0; i < count; i++) {
+                String k = "p." + i + ".";
+                String state = props.getProperty(k + "state", "UNCERTAIN");
+                if (state.equals("SENT")) state = "UNCERTAIN";
+                PAYOUTS.addLast(new Payout(props.getProperty(k + "id"), props.getProperty(k + "name"),
+                        Long.parseLong(props.getProperty(k + "amount")), state,
+                        Integer.parseInt(props.getProperty(k + "attempts", "0")), 0));
             }
-            for(int i=0;i<Integer.parseInt(props.getProperty("queue","0"));i++) {
-                String key="q."+i+".";
-                QUEUE.addLast(new Entry(props.getProperty(key+"name"),Long.parseLong(props.getProperty(key+"amount")),false));
+            int countQ = Integer.parseInt(props.getProperty("queue", "0"));
+            for (int i = 0; i < countQ; i++) {
+                String k = "q." + i + ".";
+                QUEUE.addLast(new Entry(props.getProperty(k + "name"), Long.parseLong(props.getProperty(k + "stake")), false));
             }
-            if(props.containsKey("current.name")) QUEUE.addFirst(new Entry(props.getProperty("current.name"),
-                Long.parseLong(props.getProperty("current.amount")),false));
-            say("Restored "+QUEUE.size()+" queued spins and "+PAYMENTS.size()+" payout records.");
+            if (props.containsKey("current.name")) {
+                QUEUE.addFirst(new Entry(props.getProperty("current.name"), Long.parseLong(props.getProperty("current.stake")), false));
+            }
+            say("Restored " + PAYOUTS.size() + " payout records and " + QUEUE.size() + " pending spins.");
             saveLedger();
-        } catch(Exception e) {say("ERROR loading ledger: "+e.getMessage());}
+        } catch (Exception e) { say("ERROR loading ledger: " + e.getMessage()); }
     }
 
     private static void saveLedger() {
-        if(!loaded || ledger==null) return;
+        if (!ledgerLoaded || ledgerFile == null) return;
         try {
-            Files.createDirectories(ledger.getParent());
-            Properties props=new Properties();int i=0;
-            for(Payment p:PAYMENTS) {
-                String key="p."+i+++".";
-                props.setProperty(key+"id",p.id);props.setProperty(key+"name",p.name);
-                props.setProperty(key+"amount",Long.toString(p.amount));
-                props.setProperty(key+"status",p.status);
-                props.setProperty(key+"attempts",Integer.toString(p.attempts));
+            Files.createDirectories(ledgerFile.getParent());
+            Properties props = new Properties();
+            int i = 0;
+            for (Payout p : PAYOUTS) {
+                String k = "p." + i++ + ".";
+                props.setProperty(k + "id", p.id()); props.setProperty(k + "name", p.name());
+                props.setProperty(k + "amount", Long.toString(p.amount()));
+                props.setProperty(k + "state", p.state());
+                props.setProperty(k + "attempts", Integer.toString(p.attempts()));
             }
-            props.setProperty("count",Integer.toString(i));i=0;
-            for(Entry e:QUEUE) if(!e.dry()) {
-                String key="q."+i+++".";
-                props.setProperty(key+"name",e.name());props.setProperty(key+"amount",Long.toString(e.stake()));
+            props.setProperty("count", Integer.toString(i));
+            i = 0;
+            for (Entry e : QUEUE) {
+                if (e.dry()) continue;
+                String k = "q." + i++ + ".";
+                props.setProperty(k + "name", e.name()); props.setProperty(k + "stake", Long.toString(e.stake()));
             }
-            props.setProperty("queue",Integer.toString(i));
-            if(current!=null && phase==Phase.SPINNING && !current.dry()) {
-                props.setProperty("current.name",current.name());
-                props.setProperty("current.amount",Long.toString(current.stake()));
+            props.setProperty("queue", Integer.toString(i));
+            if (current != null && phase == Phase.SPINNING && !current.dry()) {
+                props.setProperty("current.name", current.name());
+                props.setProperty("current.stake", Long.toString(current.stake()));
             }
-            Path tmp=ledger.resolveSibling("payspin-ledger.tmp");
-            try(OutputStream out=Files.newOutputStream(tmp)){props.store(out,"PaySpin payout journal");}
-            Files.move(tmp,ledger,StandardCopyOption.REPLACE_EXISTING);
-        } catch(Exception e){System.err.println("[PaySpin] Ledger save failed: "+e);}
+            Path tmp = ledgerFile.resolveSibling("payspin-ledger.tmp");
+            try (OutputStream out = Files.newOutputStream(tmp)) { props.store(out, "PaySpin payment journal"); }
+            Files.move(tmp, ledgerFile, StandardCopyOption.REPLACE_EXISTING);
+        } catch (Exception e) { System.err.println("[PaySpin] Ledger write failed: " + e); }
     }
 
     // ---------------------------------------------------------------------------------
